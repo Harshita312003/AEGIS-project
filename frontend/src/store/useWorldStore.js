@@ -18,21 +18,6 @@
 //   return (id || '').replace(/^replan-/, '');
 // }
 
-// function descriptionKey(text) {
-//   return (text || '').slice(0, 50).trim().toLowerCase();
-// }
-
-// function isMeaningfulDecision(decision) {
-//   const trimmed = (decision || '').trim();
-//   return !!trimmed && trimmed !== 'Response coordinated. See tool execution chain above';
-// }
-
-// function pickBetterDecision(existingDecision, incomingDecision) {
-//   if (isMeaningfulDecision(incomingDecision)) return incomingDecision;
-//   if (isMeaningfulDecision(existingDecision)) return existingDecision;
-//   return incomingDecision || existingDecision || '';
-// }
-
 // export const useWorldStore = create((set, get) => ({
 //   connected:      false,
 //   units:          [],
@@ -40,6 +25,7 @@
 //   hospitals:      [],
 //   blockedEdges:   [],
 //   stats:          {},
+//   unitRoutes:     {}, // unitId → { path, unitType, unitName, origin, destination, etaMinutes, incidentId }
 
 //   // Only ONE active thought shown at a time. Max 5 completed in history.
 //   activeThought:  null,   // The thought currently streaming (object)
@@ -71,19 +57,7 @@
 //   })),
 
 //   addIncident: incident => set(state => {
-//     const source = incident.metadata?._source || incident._source;
-//     const incidentDescriptionKey = descriptionKey(incident.description);
-//     const isLiveNews = source === 'live_news' || source === 'live_news_keyword';
-
 //     if (state.eventFeed.some(e => e.id === incident.id)) return {};
-//     if (
-//       isLiveNews &&
-//       incidentDescriptionKey &&
-//       state.eventFeed.some(e => descriptionKey(e.description) === incidentDescriptionKey)
-//     ) {
-//       return {};
-//     }
-
 //     return {
 //       incidents: [incident, ...state.incidents.filter(i => i.id !== incident.id)].slice(0, 30),
 //       eventFeed: [
@@ -93,7 +67,7 @@
 //           zone:        incident.zone,
 //           priority:    incident.priority,
 //           description: incident.description,
-//           source,
+//           source:      incident.metadata?._source || incident._source,
 //           headline:    incident.metadata?._headline,
 //           timestamp:   incident.createdAt || new Date().toISOString(),
 //         },
@@ -107,7 +81,7 @@
 //   })),
 
 //   // ── Thought: ONE active card at a time ────────────────────────────────────
-//   startThought: ({ agentId, incidentId, eventType = null, zone = null }) => {
+//   startThought: ({ agentId, incidentId }) => {
 //     const base = baseId(incidentId);
 //     set(state => {
 //       // If there's an active thought for the same base incident, just reset it
@@ -116,8 +90,6 @@
 //           activeThought: {
 //             ...state.activeThought,
 //             incidentId,
-//             eventType,
-//             zone,
 //             tokens: '',
 //             toolCalls: [],
 //             done: false,
@@ -134,7 +106,6 @@
 //         activeThought: {
 //           id: `${agentId}-${base}`,
 //           agentId, incidentId, baseId: base,
-//           eventType, zone,
 //           tokens: '', toolCalls: [], done: false,
 //           replanCount: 0,
 //           startedAt: new Date().toISOString(),
@@ -178,27 +149,19 @@
 //   addSecurityEvent: ev => set(state => {
 //     if (ev.eventType === 'FIREWALL_PASS') return {};
 //     if (state.securityFeed.some(e => e.eventId === ev.eventId && ev.eventId)) return {};
-//     if (state.securityFeed.some(e => e._key === ev._key && ev._key)) return {};
-//     return { securityFeed: [{ ...ev, _key: ev._key || Date.now() }, ...state.securityFeed].slice(0, 10) };
+//     return { securityFeed: [{ ...ev, _key: Date.now() }, ...state.securityFeed].slice(0, 10) };
 //   }),
 
 //   // ── Audit — one entry per base incident, always update not duplicate ───────
 //   addAuditEntry: entry => set(state => {
-//     const now = new Date().toISOString();
 //     const base = baseId(entry.incidentId);
 //     const idx  = state.auditTimeline.findIndex(e => baseId(e.incidentId) === base);
-//     const existing = idx !== -1 ? state.auditTimeline[idx] : null;
-//     const existingTools = existing?.toolCalls || [];
-//     const incomingTools = entry.toolCalls || [];
 
 //     const merged = {
-//       ...(existing || {}),
 //       ...entry,
 //       incidentId: base,
-//       toolCalls: incomingTools.length >= existingTools.length ? incomingTools : existingTools,
-//       decision: pickBetterDecision(existing?.decision, entry.decision),
-//       timestamp: entry.timestamp || existing?.timestamp || now,
-//       updatedAt: now,
+//       toolCalls: entry.toolCalls?.length > 0 ? entry.toolCalls
+//                : (idx !== -1 ? state.auditTimeline[idx].toolCalls : []),
 //     };
 
 //     if (idx !== -1) {
@@ -207,6 +170,16 @@
 //       return { auditTimeline: list };
 //     }
 //     return { auditTimeline: [merged, ...state.auditTimeline].slice(0, 15) };
+//   }),
+
+//   setUnitRoute: route => set(s => ({
+//     unitRoutes: { ...s.unitRoutes, [route.unitId]: route },
+//   })),
+
+//   clearUnitRoute: unitId => set(s => {
+//     const next = { ...s.unitRoutes };
+//     delete next[unitId];
+//     return { unitRoutes: next };
 //   }),
 
 //   blockEdge:   eid => set(s => ({ blockedEdges: [...new Set([...s.blockedEdges, eid])] })),
@@ -237,12 +210,9 @@
 //     auditTimeline:  [],
 //     replanBanner:   null,
 //     activeScenario: null,
+//     unitRoutes:     {},
 //   }),
 // }));
-
-
-
-
 
 
 
@@ -421,10 +391,65 @@ export const useWorldStore = create((set, get) => ({
       if (baseId(state.activeThought.incidentId) !== base) return {};
 
       const updated = { ...state.activeThought, tokens: state.activeThought.tokens + token, done };
+
       if (done) {
+        // Extract clean summary at archive time — pill reads this directly
+        const tools     = updated.toolCalls || [];
+        const dispatched = tools.filter(t =>
+          (t.tool === 'dispatchUnit' || t.name === 'dispatchUnit') && t.result?.success
+        );
+        const blocked = tools.filter(t =>
+          (t.tool === 'blockRoad' || t.name === 'blockRoad') && t.result?.success
+        );
+        const routed = tools.filter(t =>
+          (t.tool === 'getRoute' || t.name === 'getRoute') && t.result?.success
+        );
+        const hospitals = tools.filter(t =>
+          (t.tool === 'getHospitalCapacity' || t.name === 'getHospitalCapacity') && t.result?.success
+        );
+
+        // Extract incident type + zone from opening line of token stream
+        // Format: "[LIVE NEWS] STRUCTURAL FIRE in LN — Priority 8/10"
+        //      or "[DEMO] INFRASTRUCTURE FAILURE in CP — Priority 10/10"
+        const firstLine  = updated.tokens.split('\n')[0] || '';
+        const typeZone   = firstLine.replace(/^\[[^\]]+\]\s*/,''); // strip [SOURCE] prefix
+        const zoneMatch  = typeZone.match(/\bin\s+([A-Z]{2,3})\b/);
+        const zone       = zoneMatch ? zoneMatch[1] : null;
+        const typeRaw    = typeZone.replace(/\s*—.*$/,'').replace(/\bin\s+[A-Z]{2,3}.*/,'').trim();
+        const typeFmt    = typeRaw.toLowerCase().replace(/\b\w/g, c => c.toUpperCase()).slice(0,28);
+
+        // Build human-readable summary line
+        let summary;
+        if (dispatched.length > 0) {
+          const unitNames = dispatched
+            .map(d => d.result?.unit?.name || d.args?.unitId || 'unit')
+            .slice(0, 2)
+            .join(', ');
+          summary = `${dispatched.length} unit${dispatched.length > 1 ? 's' : ''} dispatched — ${unitNames}`;
+        } else if (blocked.length > 0) {
+          summary = `Road closed — ${blocked[0].result?.edgeName || 'route blocked'}`;
+        } else if (routed.length > 0 && hospitals.length > 0) {
+          summary = `Assessed — routed to ${hospitals[0].result?.recommendation?.split(':')[1]?.trim()?.slice(0,20) || 'hospital'}`;
+        } else if (tools.length > 0) {
+          summary = `Assessed — ${tools.length} action${tools.length > 1 ? 's' : ''}, no dispatch needed`;
+        } else {
+          summary = 'Assessed — no units required';
+        }
+
+        const archived = {
+          ...updated,
+          _summary:     summary,
+          _type:        typeFmt || 'Incident',
+          _zone:        zone,
+          _dispatched:  dispatched.length,
+          _blocked:     blocked.length,
+          _toolCount:   tools.length,
+          _completedAt: new Date().toISOString(),
+        };
+
         return {
           activeThought: null,
-          thoughtHistory: [updated, ...state.thoughtHistory].slice(0, 5),
+          thoughtHistory: [archived, ...state.thoughtHistory].slice(0, 5),
         };
       }
       return { activeThought: updated };
