@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState } from 'react';
 import { useSocket }    from './store/useSocket.js';
 import { useWorldStore } from './store/useWorldStore.js';
 import { CityMap, EventFeed, StatsBar, AuditTimeline } from './components/Panels.jsx';
@@ -16,18 +16,19 @@ const TABS = [
 
 export default function App() {
   useSocket();
-  const [tab, setTab]          = useState('map');
-  const connected              = useWorldStore(s => s.connected);
-  const activeScenario         = useWorldStore(s => s.activeScenario);
-  const replanBanner           = useWorldStore(s => s.replanBanner);
-  const activeThought          = useWorldStore(s => s.activeThought);
-  const securityFeed           = useWorldStore(s => s.securityFeed);
-  const auditTimeline          = useWorldStore(s => s.auditTimeline);
+  const [tab, setTab]  = useState('map');
+  const connected      = useWorldStore(s => s.connected);
+  const activeScenario = useWorldStore(s => s.activeScenario);
+  const replanBanner   = useWorldStore(s => s.replanBanner);
+  const activeThought  = useWorldStore(s => s.activeThought);
+  const securityFeed   = useWorldStore(s => s.securityFeed);
 
-  // Auto-jump to brain tab when AI starts thinking
-  useEffect(() => { if (activeThought) setTab('brain'); }, [!!activeThought]);
+  // NO auto-tab-switch — user always controls navigation.
+  // The AI Brain tab badge pulses when AI is thinking so user
+  // can choose to switch there when they want.
 
-  const brainBadge    = activeThought ? '●' : null;
+  const isThinking    = !!activeThought;
+  const brainBadge    = isThinking ? '●' : null;
   const securityBadge = securityFeed.filter(e=>e.eventType==='FIREWALL_BLOCK').length || null;
 
   return (
@@ -63,7 +64,15 @@ export default function App() {
               <span style={{fontSize:'14px'}}>{t.icon}</span>
               <span>{t.label}</span>
               {badge && (
-                <span style={{ position:'absolute', top:4, right:5, background: t.id==='brain'?'#00ff88':'#ff3b5c', color:'#000', fontSize:'9px', fontWeight:'700', borderRadius:'8px', padding:'0 4px', lineHeight:'14px', minWidth:'14px', textAlign:'center' }}>
+                <span style={{
+                  position:'absolute', top:4, right:5,
+                  background: t.id==='brain' && isThinking ? '#00ff88' : t.id==='brain' ? '#00ff88' : '#ff3b5c',
+                  color: t.id==='brain' ? '#000' : '#fff',
+                  fontSize:'9px', fontWeight:'700', borderRadius:'8px',
+                  padding:'0 4px', lineHeight:'14px', minWidth:'14px', textAlign:'center',
+                  boxShadow: t.id==='brain' && isThinking ? '0 0 8px #00ff88' : 'none',
+                  animation: t.id==='brain' && isThinking ? 'pulse 0.8s ease-in-out infinite' : 'none',
+                }}>
                   {typeof badge==='number'&&badge>9?'9+':badge}
                 </span>
               )}
@@ -71,14 +80,33 @@ export default function App() {
           );
         })}
 
-        {/* Center alert */}
-        <div style={{ flex:1, display:'flex', justifyContent:'center' }}>
-          {activeScenario && (
-            <div style={{ display:'flex', alignItems:'center', gap:'6px', padding:'4px 14px', borderRadius:'20px', background:'rgba(255,215,0,0.08)', border:'1px solid rgba(255,215,0,0.3)', fontSize:'11px', fontWeight:'600', color:'#ffd700', animation:'pulse 1.2s ease-in-out infinite' }}>
+        {/* Center alert — always shows AI status so user never loses context */}
+        <div style={{ flex:1, display:'flex', justifyContent:'center', gap:'8px', alignItems:'center' }}>
+
+          {/* AI thinking indicator — visible from ALL tabs */}
+          {isThinking && tab !== 'brain' && (
+            <button
+              onClick={() => setTab('brain')}
+              style={{ display:'flex', alignItems:'center', gap:'7px', padding:'4px 14px', borderRadius:'20px', background:'rgba(0,255,136,0.08)', border:'1px solid rgba(0,255,136,0.4)', fontSize:'11px', fontWeight:'600', color:'#00ff88', cursor:'pointer', fontFamily:'inherit', animation:'pulse 1s ease-in-out infinite' }}
+            >
+              <div style={{ width:6, height:6, borderRadius:'50%', background:'#00ff88', boxShadow:'0 0 6px #00ff88' }} />
+              AI IS THINKING — click to watch
+            </button>
+          )}
+          {isThinking && tab === 'brain' && (
+            <div style={{ display:'flex', alignItems:'center', gap:'7px', padding:'4px 14px', borderRadius:'20px', background:'rgba(0,255,136,0.08)', border:'1px solid rgba(0,255,136,0.3)', fontSize:'11px', fontWeight:'600', color:'#00ff88', animation:'pulse 1s ease-in-out infinite' }}>
+              <div style={{ width:6, height:6, borderRadius:'50%', background:'#00ff88', boxShadow:'0 0 6px #00ff88' }} />
+              AI REASONING LIVE
+            </div>
+          )}
+
+          {/* Scenario / replan alerts */}
+          {activeScenario && !isThinking && (
+            <div style={{ display:'flex', alignItems:'center', gap:'6px', padding:'4px 14px', borderRadius:'20px', background:'rgba(255,215,0,0.08)', border:'1px solid rgba(255,215,0,0.3)', fontSize:'11px', fontWeight:'600', color:'#ffd700' }}>
               ⚡ {activeScenario.scenarioName?.toUpperCase()}
             </div>
           )}
-          {replanBanner && !activeScenario && (
+          {replanBanner && !activeScenario && !isThinking && (
             <div style={{ display:'flex', alignItems:'center', gap:'6px', padding:'4px 14px', borderRadius:'20px', background:'rgba(255,107,53,0.08)', border:'1px solid rgba(255,107,53,0.3)', fontSize:'11px', fontWeight:'600', color:'#ff6b35' }}>
               🔄 REPLANNING — {replanBanner.reason?.slice(0,40)}
             </div>
