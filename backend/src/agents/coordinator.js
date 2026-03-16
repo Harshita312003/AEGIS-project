@@ -1,7 +1,6 @@
 import { groq, MODEL } from '../config.js';
 import { worldState } from '../core/worldState.js';
 import { eventQueue } from '../core/eventQueue.js';
-
 import { ALL_TOOLS_SCHEMAS, executeTool } from '../tools/index.js';
 import { runFirewall } from '../security/firewall.js';
 import { logger } from '../utils/logger.js';
@@ -9,61 +8,39 @@ import { broadcast, broadcastToken, broadcastDecision } from '../utils/broadcast
 import { AuditEntry } from '../models/AuditEntry.js';
 import { Incident } from '../models/Incident.js';
 
-const MAX_REACT_ITERATIONS = 8;
+const MAX_REACT_ITERATIONS = 6;
 
-// Human-readable descriptions for each tool call broadcasted to ThoughtTrace
 const TOOL_THINKING = {
-  getAvailableUnits:      (args) => `🔍 Checking available ${args.type || 'emergency'} units${args.zone ? ` in ${args.zone}` : ' across all zones'}...`,
-  getRoute:               (args) => `📍 Calculating fastest route: ${args.origin} → ${args.destination}...`,
-  blockRoad:              (args) => `🚧 Closing road edge ${args.edgeId} — ${args.reason || 'structural failure'}...`,
-  dispatchUnit:           (args) => `🚀 Dispatching unit ${args.unitId} to zone ${args.destination}...`,
-  returnUnit:             (args) => `↩️ Recalling unit ${args.unitId} back to base...`,
-  getHospitalCapacity:    (args) => `🏥 Checking hospital bed availability${args.zone ? ` near ${args.zone}` : ''}...`,
-  updateHospitalCapacity: (args) => `🏥 Updating hospital ${args.hospitalId} intake — ${args.availableBeds} beds remaining...`,
-  getWeather:             (args) => `🌬️ Reading wind conditions in zone ${args.zone} — checking fire spread risk...`,
-  notifyCitizens:         (args) => `📢 Broadcasting public alert to zone ${args.zone}: "${args.message?.slice(0, 50)}"...`,
+  getAvailableUnits: args => `🔍 Checking available ${args.type || 'emergency'} units${args.zone ? ` in ${args.zone}` : ''}...`,
+  getRoute: args => `📍 Calculating fastest route: ${args.origin} -> ${args.destination}...`,
+  blockRoad: args => `🚧 Closing road edge ${args.edgeId} — ${args.reason || 'structural failure'}...`,
+  dispatchUnit: args => `🚀 Dispatching unit ${args.unitId} to zone ${args.destination}...`,
+  returnUnit: args => `↩️ Recalling unit ${args.unitId} back to base...`,
+  getHospitalCapacity: args => `🏥 Checking hospital beds${args.zone ? ` near ${args.zone}` : ''}...`,
+  updateHospitalCapacity: args => `🏥 Updating hospital ${args.hospitalId} intake...`,
+  getWeather: args => `🌬️ Reading wind and fire spread data for zone ${args.zone}...`,
+  notifyCitizens: args => `📢 Broadcasting public alert to zone ${args.zone}...`,
 };
 
-const COORDINATOR_SYSTEM_PROMPT = `You are AEGIS — Autonomous Emergency Grid Intelligence System — the master coordinator for Delhi emergency response.
+const COORDINATOR_SYSTEM_PROMPT = `You are AEGIS — the AI emergency coordinator for Delhi.
 
-You coordinate Police, Fire, EMS, and Traffic agencies from a single unified command.
+ALWAYS begin your response by calling getAvailableUnits() first — no exceptions.
+Then call getRoute() for each unit you plan to dispatch.
+Then call dispatchUnit() for each chosen unit.
+For fires: also call getWeather() to check wind direction.
+For casualties: call getHospitalCapacity() before routing patients.
 
-DELHI ZONES (2-3 letter codes):
-- CP: Connaught Place (central business district)
-- RP: Rajpath / India Gate (government zone)
-- KB: Karol Bagh (dense commercial/residential)
-- LN: Lajpat Nagar (south Delhi market)
-- DW: Dwarka (southwest residential)
-- RH: Rohini (north Delhi hub)
-- SD: Shahdara (east Delhi — across Yamuna)
-- NP: Nehru Place (IT hub)
-- IGI: IGI Airport (southwest)
-- OKH: Okhla (southeast industrial)
+DELHI ZONES: CP=Connaught Place, RP=Rajpath, KB=Karol Bagh, LN=Lajpat Nagar,
+DW=Dwarka, RH=Rohini, SD=Shahdara, NP=Nehru Place, IGI=Airport, OKH=Okhla
+Yamuna Bridge = edge e5 (CP↔SD)
 
-KEY INFRASTRUCTURE: e5 = Yamuna Bridge (CP↔SD) — the only direct central-east crossing.
-
-YOUR DECISION PROTOCOL — follow EXACTLY:
-1. Assess the incident: zone, type, severity, casualties
-2. Call getAvailableUnits() to see what you have
-3. Call getRoute() for each unit you plan to dispatch — confirm travel time
-4. For fires: call getWeather() — wind direction determines fire spread
-5. For casualties: call getHospitalCapacity() — route to best available hospital
-6. Dispatch units with dispatchUnit() — be specific about which unit and why
-7. Notify citizens if evacuation or road closure is needed
-8. State your final decision clearly: what you dispatched, why, ETA
-
-PRINCIPLES:
-- Life safety over property over infrastructure
-- Nearest appropriate unit, not just nearest unit — match specialty to incident
-- Always dispatch a minimum viable response first, reserve units for escalation
-- Transparency: explain every decision — judges and operators are watching your reasoning
-
-You are live during a national emergency. Every decision is logged. Think clearly, act decisively.`;
-
-// ─── Main coordinator loop ────────────────────────────────────────────────────
+DECISION PRIORITY: Life safety > property > infrastructure
+Match unit specialty to incident type. Dispatch minimum viable response first.
+Every decision is logged. Be decisive and specific.`;
 
 export async function startCoordinatorLoop() {
-  logger.success('🧠 Coordinator loop started — waiting for events');
+  logger.success('🧠 Coordinator loop started');
+
   while (true) {
     try {
       const event = await eventQueue.dequeue();
@@ -75,184 +52,267 @@ export async function startCoordinatorLoop() {
   }
 }
 
-// ─── Process a single event ───────────────────────────────────────────────────
-
 async function processEvent(event) {
   const incidentId = event.id;
   logger.agent('coordinator', `Processing: ${event.type} in ${event.zone} [P${event.priority}]`);
 
-  // ── 0. Firewall ───────────────────────────────────────────────────────────
-  const firewallResult = await runFirewall(event).catch(err => ({ passed: true, event }));
+  const firewallResult = await runFirewall(event).catch(() => ({ passed: true, event }));
   if (!firewallResult || !firewallResult.passed) {
     logger.firewall('BLOCK', `Event ${incidentId} quarantined`);
     return;
   }
 
-  // ── 1. Create incident ────────────────────────────────────────────────────
   const incident = worldState.createIncident({
-    id: incidentId, type: event.type, subtype: event.subtype,
-    zone: event.zone, priority: event.priority,
-    description: event.description, metadata: event.metadata || event,
+    id: incidentId,
+    type: event.type,
+    subtype: event.subtype,
+    zone: event.zone,
+    priority: event.priority,
+    description: event.description,
+    metadata: event.metadata || event,
   });
 
   Incident.create({
-    incidentId, type: event.type, subtype: event.subtype,
-    zone: event.zone, priority: event.priority,
-    description: event.description, metadata: event.metadata || event,
-  }).catch(err => logger.error('Incident write failed:', err.message));
+    incidentId,
+    type: event.type,
+    subtype: event.subtype,
+    zone: event.zone,
+    priority: event.priority,
+    description: event.description,
+    metadata: event,
+  }).catch(() => {});
 
   broadcast({ type: 'INCIDENT_RECEIVED', payload: { ...incident } });
-
-  // ── 2. Signal ThoughtTrace to open a new entry ────────────────────────────
   broadcast({
     type: 'THOUGHT_START',
     payload: { agentId: 'coordinator', incidentId, eventType: event.type, zone: event.zone },
   });
 
-  // ── 3. Broadcast initial "thinking" status so panel isn't empty ───────────
-  const eventLabel  = event.type.replace(/_/g, ' ');
-  const sourceLabel = event._source === 'live_news' ? '[LIVE INCIDENT — News verified]'
-                    : event._source === 'simulation_fallback' ? '[DRILL SIMULATION]'
-                    : event._scenario ? '[DEMO SCENARIO]'
-                    : '[INCIDENT]';
+  const sourceLabel = event._source === 'live_news'
+    ? '[LIVE NEWS]'
+    : event._source === 'simulation_fallback'
+      ? '[SIMULATION]'
+      : event._scenario
+        ? '[DEMO]'
+        : '[INCIDENT]';
+
   const openingText =
-    `${sourceLabel} INCIDENT ${incidentId}\n` +
-    `Type: ${eventLabel.toUpperCase()} | Zone: ${event.zone} | Priority: ${event.priority}/10\n` +
-    `${event._headline ? 'Source: "' + event._headline + '"\n' : ''}` +
-    `Status: Analyzing city state and available resources...\n\n`;
+    `${sourceLabel} ${event.type.replace(/_/g, ' ').toUpperCase()} in ${event.zone} — Priority ${event.priority}/10\n` +
+    `${event._headline ? `Source: "${event._headline}"\n` : ''}` +
+    'Analyzing city state...\n\n';
 
   broadcastToken('coordinator', incidentId, openingText, false);
 
-  // ── 4. Build message chain ────────────────────────────────────────────────
-  const citySnapshot = worldState.getSnapshot();
-  const messages = [
-    { role: 'system', content: COORDINATOR_SYSTEM_PROMPT },
-    { role: 'user',   content: buildUserMessage(event, citySnapshot) },
-  ];
-
-  // ── 5. ReAct loop ─────────────────────────────────────────────────────────
-  let iterations    = 0;
   let fullReasoning = openingText;
   const toolCallLog = [];
+  let iterations = 1;
+  let messages = [];
+  let finalDecision = '';
 
-  while (iterations < MAX_REACT_ITERATIONS) {
-    iterations++;
+  if (shouldUseLowPrioritySimulationFastPath(event)) {
+    const fastPathText = '\nLow-priority simulation fallback detected. Running limited coordination path.\n';
+    broadcastToken('coordinator', incidentId, fastPathText, false);
+    fullReasoning += fastPathText;
 
-    // Broadcast "step" label so user knows a new reasoning pass is starting
-    if (iterations > 1) {
-      const stepText = `\n[STEP ${iterations} — Reviewing tool results and deciding next action...]\n`;
-      broadcastToken('coordinator', incidentId, stepText, false);
-      fullReasoning += stepText;
+    const fastPathTools = [
+      { toolName: 'getAvailableUnits', parsedArgs: { zone: event.zone } },
+      {
+        toolName: 'notifyCitizens',
+        parsedArgs: {
+          zone: event.zone,
+          message: buildLowPriorityNotification(event),
+          severity: 'low',
+        },
+      },
+    ];
+
+    for (const plannedTool of fastPathTools) {
+      const executedTool = await executeCoordinatorTool({
+        incidentId,
+        toolName: plannedTool.toolName,
+        parsedArgs: plannedTool.parsedArgs,
+        step: 1,
+      });
+      toolCallLog.push(executedTool.logEntry);
+      fullReasoning += executedTool.reasoningDelta;
     }
 
-    // REASON — call Groq with streaming
-    const { text, toolCalls } = await streamGroqCall(messages, incidentId);
-    if (text) fullReasoning += text;
+    finalDecision = buildLowPrioritySimulationDecision(event);
+  } else {
+    const snapshot = worldState.getSnapshot();
+    messages = [
+      { role: 'system', content: COORDINATOR_SYSTEM_PROMPT },
+      { role: 'user', content: buildUserMessage(event, snapshot) },
+    ];
 
-    // No tool calls = final decision reached
-    if (toolCalls.length === 0) {
-      if (!text) {
-        // Model returned nothing — broadcast a fallback message
-        const fallback = `\nAnalysis complete. Reviewing all dispatched units and active response.\n`;
-        broadcastToken('coordinator', incidentId, fallback, false);
-        fullReasoning += fallback;
+    try {
+      const firstResponse = await groq.chat.completions.create({
+        model: MODEL,
+        messages,
+        tools: ALL_TOOLS_SCHEMAS,
+        tool_choice: 'required',
+        max_tokens: 300,
+        temperature: 0.1,
+        stream: false,
+      });
+
+      const firstMessage = firstResponse.choices[0].message;
+      const firstTools = firstMessage.tool_calls || [];
+
+      if (firstTools.length === 0) {
+        logger.warn('Groq returned 0 tools even with required — using text response');
+        const fallbackText = firstMessage.content || 'Assessed incident. Monitoring situation.';
+        broadcastToken('coordinator', incidentId, fallbackText, false);
+        fullReasoning += fallbackText;
+        messages.push({ role: 'assistant', content: fallbackText });
+      } else {
+        if (firstMessage.content) {
+          broadcastToken('coordinator', incidentId, firstMessage.content, false);
+          fullReasoning += firstMessage.content;
+        }
+
+        messages.push({ role: 'assistant', content: firstMessage.content || '', tool_calls: firstTools });
+
+        const toolResultMessages = [];
+        for (const toolCall of firstTools) {
+          let parsedArgs;
+          try {
+            parsedArgs = JSON.parse(toolCall.function.arguments);
+          } catch {
+            parsedArgs = {};
+          }
+
+          const executedTool = await executeCoordinatorTool({
+            incidentId,
+            toolName: toolCall.function.name,
+            parsedArgs,
+            rawArgs: toolCall.function.arguments,
+            step: 1,
+          });
+
+          toolCallLog.push(executedTool.logEntry);
+          fullReasoning += executedTool.reasoningDelta;
+          toolResultMessages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(executedTool.result),
+          });
+        }
+        messages.push(...toolResultMessages);
       }
-      logger.agent('coordinator', `Final decision after ${iterations} step(s)`);
-      break;
+    } catch (err) {
+      logger.error('First Groq call failed:', err.message);
+      broadcastToken('coordinator', incidentId, `\nError contacting AI: ${err.message}\n`, false);
     }
 
-    // Append assistant message
-    messages.push({ role: 'assistant', content: text || '', tool_calls: toolCalls });
+    const shouldSkipContinuation =
+      event.priority < 8 &&
+      toolCallLog.some(toolCall => toolCall.name === 'dispatchUnit' && toolCall.result?.success);
 
-    // ACT + OBSERVE — execute tools
-    const toolResultMessages = [];
+    if (shouldSkipContinuation) {
+      const finalizeText = '\nSimple incident handled in step 1. Finalizing response.\n';
+      broadcastToken('coordinator', incidentId, finalizeText, false);
+      fullReasoning += finalizeText;
+    } else {
+      while (iterations < MAX_REACT_ITERATIONS) {
+        iterations += 1;
 
-    for (const tc of toolCalls) {
-      const toolName  = tc.function.name;
-      let   parsedArgs;
-      try { parsedArgs = JSON.parse(tc.function.arguments); } catch { parsedArgs = {}; }
+        const stepText = `\n[Step ${iterations} — Continuing coordination...]\n`;
+        broadcastToken('coordinator', incidentId, stepText, false);
+        fullReasoning += stepText;
 
-      // Broadcast human-readable "what I'm doing now" before executing
-      const thinkingMsg = TOOL_THINKING[toolName]
-        ? TOOL_THINKING[toolName](parsedArgs)
-        : `→ Calling ${toolName}...`;
-      broadcastToken('coordinator', incidentId, `\n${thinkingMsg}`, false);
-      fullReasoning += `\n${thinkingMsg}`;
+        const { text, toolCalls } = await streamGroqCall(messages, incidentId);
+        if (text) fullReasoning += text;
 
-      const { name, result } = await executeTool(toolName, tc.function.arguments);
-      toolCallLog.push({ name, arguments: parsedArgs, result, step: iterations });
+        if (toolCalls.length === 0) {
+          logger.agent('coordinator', `Coordination complete after ${iterations} step(s)`);
+          break;
+        }
 
-      // Broadcast the tool result summary
-      const resultSummary = buildResultSummary(name, result, parsedArgs);
-      broadcastToken('coordinator', incidentId, `\n${resultSummary}`, false);
-      fullReasoning += `\n${resultSummary}`;
+        messages.push({ role: 'assistant', content: text || '', tool_calls: toolCalls });
 
-      broadcast({
-        type: 'TOOL_EXECUTED',
-        payload: { agentId: 'coordinator', incidentId, tool: name, args: parsedArgs, result },
-      });
+        const toolResultMessages = [];
+        for (const toolCall of toolCalls) {
+          let parsedArgs;
+          try {
+            parsedArgs = JSON.parse(toolCall.function.arguments);
+          } catch {
+            parsedArgs = {};
+          }
 
-      toolResultMessages.push({
-        role: 'tool', tool_call_id: tc.id,
-        content: JSON.stringify(result),
-      });
+          const executedTool = await executeCoordinatorTool({
+            incidentId,
+            toolName: toolCall.function.name,
+            parsedArgs,
+            rawArgs: toolCall.function.arguments,
+            step: iterations,
+          });
+
+          toolCallLog.push(executedTool.logEntry);
+          fullReasoning += executedTool.reasoningDelta;
+          toolResultMessages.push({
+            role: 'tool',
+            tool_call_id: toolCall.id,
+            content: JSON.stringify(executedTool.result),
+          });
+        }
+        messages.push(...toolResultMessages);
+      }
     }
 
-    messages.push(...toolResultMessages);
+    finalDecision = extractFinalDecision(messages) || buildAutoSummary(toolCallLog, event);
   }
 
-  // ── 6. Extract and broadcast final decision ───────────────────────────────
-  const finalDecision = extractFinalDecision(messages);
+  finalDecision ||= buildAutoSummary(toolCallLog, event);
 
-  // Append final decision to the stream so it's visible in ThoughtTrace
-  const finalText = `\n\n[FINAL DECISION]\n${finalDecision}`;
+  const finalText = `\n\n[DECISION]\n${finalDecision}`;
   broadcastToken('coordinator', incidentId, finalText, false);
 
   broadcastDecision('coordinator', incidentId, fullReasoning, toolCallLog, finalDecision, event.type, event.zone);
+  broadcast({ type: 'THOUGHT_END', payload: { agentId: 'coordinator', incidentId, decision: finalDecision } });
 
-  broadcast({
-    type: 'THOUGHT_END',
-    payload: { agentId: 'coordinator', incidentId, decision: finalDecision },
-  });
+  const dispatched = toolCallLog
+    .filter(toolCall => toolCall.name === 'dispatchUnit' && toolCall.result?.success)
+    .map(toolCall => toolCall.result.unit.id);
 
-  // ── 7. Update WorldState ──────────────────────────────────────────────────
-  const dispatchedUnits = toolCallLog
-    .filter(tc => tc.name === 'dispatchUnit' && tc.result?.success)
-    .map(tc => tc.result.unit.id);
-
-  if (dispatchedUnits.length > 0) {
-    worldState.updateIncident(incidentId, { unitsDispatched: dispatchedUnits });
+  if (dispatched.length > 0) {
+    worldState.updateIncident(incidentId, { unitsDispatched: dispatched });
   }
 
-  // ── 8. Persist to MongoDB ─────────────────────────────────────────────────
   AuditEntry.create({
-    incidentId, agentType: 'coordinator',
-    eventType: event.type, zone: event.zone, priority: event.priority,
-    reasoning: fullReasoning, toolCalls: toolCallLog,
-    decision: finalDecision, metadata: { iterations, dispatchedUnits },
-  }).catch(err => logger.error('Audit write failed:', err.message));
+    incidentId,
+    agentType: 'coordinator',
+    eventType: event.type,
+    zone: event.zone,
+    priority: event.priority,
+    reasoning: fullReasoning,
+    toolCalls: toolCallLog,
+    decision: finalDecision,
+    metadata: { iterations, dispatched },
+  }).catch(() => {});
 
-  logger.agent('coordinator', `✅ Done in ${iterations} step(s). Dispatched: ${dispatchedUnits.length} unit(s)`);
+  logger.agent(
+    'coordinator',
+    `✅ Done in ${iterations} steps. Dispatched: ${dispatched.length} unit(s). Tools used: ${toolCallLog.length}`,
+  );
 }
-
-// ─── Groq streaming call ──────────────────────────────────────────────────────
 
 async function streamGroqCall(messages, incidentId) {
   let fullText = '';
   const toolCalls = [];
 
   try {
-    // First iteration: force tool use so AI always checks units/routes
-    // Subsequent iterations: auto lets AI decide when it has enough info
-    const toolChoice = iterations === 1 ? 'required' : 'auto';
     const stream = await groq.chat.completions.create({
-      model: MODEL, messages,
-      tools: ALL_TOOLS_SCHEMAS, tool_choice: toolChoice,
-      max_tokens: 1024, temperature: 0.1, stream: true,
+      model: MODEL,
+      messages,
+      tools: ALL_TOOLS_SCHEMAS,
+      tool_choice: 'auto',
+      max_tokens: 500,
+      temperature: 0.1,
+      stream: true,
     });
 
     const accumulator = {};
-
     for await (const chunk of stream) {
       const delta = chunk.choices[0]?.delta;
       if (!delta) continue;
@@ -263,98 +323,141 @@ async function streamGroqCall(messages, incidentId) {
       }
 
       if (delta.tool_calls) {
-        for (const tc of delta.tool_calls) {
-          if (!accumulator[tc.index]) {
-            accumulator[tc.index] = { id: '', type: 'function', function: { name: '', arguments: '' } };
+        for (const toolCall of delta.tool_calls) {
+          if (!accumulator[toolCall.index]) {
+            accumulator[toolCall.index] = { id: '', type: 'function', function: { name: '', arguments: '' } };
           }
-          const acc = accumulator[tc.index];
-          if (tc.id)                  acc.id                   = tc.id;
-          if (tc.function?.name)      acc.function.name        = tc.function.name;
-          if (tc.function?.arguments) acc.function.arguments  += tc.function.arguments;
+
+          const entry = accumulator[toolCall.index];
+          if (toolCall.id) entry.id = toolCall.id;
+          if (toolCall.function?.name) entry.function.name = toolCall.function.name;
+          if (toolCall.function?.arguments) entry.function.arguments += toolCall.function.arguments;
         }
       }
     }
 
-    Object.values(accumulator).forEach(tc => toolCalls.push(tc));
+    Object.values(accumulator).forEach(toolCall => toolCalls.push(toolCall));
     broadcastToken('coordinator', incidentId, '', true);
-
   } catch (err) {
-    logger.error('Groq error:', err.message);
-    broadcastToken('coordinator', incidentId, `\n❌ Groq API error: ${err.message}`, true);
-    broadcast({ type: 'COORDINATOR_ERROR', payload: { incidentId, error: err.message } });
+    logger.error('Groq streaming error:', err.message);
+    broadcastToken('coordinator', incidentId, `\n⚠ AI error: ${err.message}`, true);
   }
 
   return { text: fullText, toolCalls };
 }
 
-// ─── Result summary builder ───────────────────────────────────────────────────
+async function executeCoordinatorTool({ incidentId, toolName, parsedArgs, rawArgs = parsedArgs, step }) {
+  const thinkingMsg = TOOL_THINKING[toolName] ? TOOL_THINKING[toolName](parsedArgs) : `→ ${toolName}...`;
+  broadcastToken('coordinator', incidentId, `\n${thinkingMsg}`, false);
+
+  const { name, result } = await executeTool(toolName, rawArgs);
+  const summary = buildResultSummary(name, result, parsedArgs);
+  broadcastToken('coordinator', incidentId, `\n${summary}`, false);
+
+  broadcast({
+    type: 'TOOL_EXECUTED',
+    payload: { agentId: 'coordinator', incidentId, tool: name, args: parsedArgs, result },
+  });
+
+  return {
+    result,
+    logEntry: { name, arguments: parsedArgs, result, step },
+    reasoningDelta: `\n${thinkingMsg}\n${summary}`,
+  };
+}
 
 function buildResultSummary(toolName, result, args) {
-  if (!result.success && result.success !== undefined) {
-    return `  ⚠️  Failed: ${result.error || 'unknown error'}`;
-  }
+  if (result.success === false) return `  ✗ Failed: ${result.error || 'unknown error'}`;
+
   switch (toolName) {
     case 'getAvailableUnits':
-      return `  ✓ Found ${result.totalAvailable} available units (Police:${result.summary?.police} Fire:${result.summary?.fire} EMS:${result.summary?.ems} Traffic:${result.summary?.traffic})`;
+      return `  ✓ ${result.totalAvailable} units available (P:${result.summary?.police} F:${result.summary?.fire} E:${result.summary?.ems} T:${result.summary?.traffic})`;
     case 'getRoute':
       return result.success
-        ? `  ✓ Route found: ${result.pathNames?.join(' → ')} — ETA ${result.totalTimeMinutes} min`
+        ? `  ✓ Route: ${result.pathNames?.join(' -> ')} — ETA ${result.totalTimeMinutes} min`
         : `  ✗ No route: ${result.error}`;
     case 'blockRoad':
-      return `  ✓ ${result.edgeName || args.edgeId} is now BLOCKED — all routing rerouted`;
+      return `  ✓ ${result.edgeName || args.edgeId} CLOSED — all routing rerouted`;
     case 'dispatchUnit':
-      return `  ✓ ${result.unit?.callSign || args.unitId} dispatched → ${args.destination}`;
+      return `  ✓ ${result.unit?.callSign || args.unitId} -> ${args.destination}`;
     case 'returnUnit':
-      return `  ✓ ${result.unit?.name || args.unitId} returned to available`;
+      return `  ✓ ${result.unit?.name || args.unitId} returned to base`;
     case 'getHospitalCapacity':
-      return `  ✓ ${result.recommendation || `${result.totalAvailableBeds} beds available across ${result.totalQueried} hospitals`}`;
-    case 'updateHospitalCapacity':
-      return `  ✓ ${result.hospital?.name || args.hospitalId} updated: ${result.hospital?.availableBeds} beds remaining`;
+      return `  ✓ ${result.recommendation || `${result.totalAvailableBeds} beds available`}`;
     case 'getWeather':
-      return `  ✓ Zone ${args.zone}: Wind ${result.weather?.windSpeed}km/h ${result.weather?.windDirection} — Fire spread risk: ${result.weather?.fireSpreadRisk}`;
+      return `  ✓ Wind: ${result.weather?.windSpeed}km/h ${result.weather?.windDirection} — Fire spread: ${result.weather?.fireSpreadRisk}`;
     case 'notifyCitizens':
-      return `  ✓ Alert broadcast to zone ${args.zone} [${args.severity?.toUpperCase()}]`;
+      return `  ✓ Alert sent to zone ${args.zone} [${(args.severity || 'high').toUpperCase()}]`;
     default:
       return `  ✓ ${toolName} completed`;
   }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+function shouldUseLowPrioritySimulationFastPath(event) {
+  return event.priority < 5 && event._source === 'simulation_fallback';
+}
+
+function buildLowPriorityNotification(event) {
+  const label = event.type.replace(/_/g, ' ');
+  return `Low-priority ${label} reported in ${event.zone}. Avoid the area and await updates.`;
+}
+
+function buildLowPrioritySimulationDecision(event) {
+  return `Low-priority simulation in ${event.zone} assessed. Unit availability was checked and a public advisory was issued. No dispatch or hospital escalation is required at this time.`;
+}
+
+function buildAutoSummary(toolCallLog, event) {
+  const dispatched = toolCallLog.filter(toolCall => toolCall.name === 'dispatchUnit' && toolCall.result?.success);
+  const blocked = toolCallLog.filter(toolCall => toolCall.name === 'blockRoad' && toolCall.result?.success);
+
+  if (dispatched.length === 0 && blocked.length === 0) {
+    return `Assessed ${event.type.replace(/_/g, ' ')} in ${event.zone}. All units currently allocated to active incidents. Monitoring situation — will dispatch when capacity available.`;
+  }
+
+  const lines = [];
+  if (blocked.length > 0) lines.push(`Closed ${blocked.length} road(s). All routing rerouted automatically.`);
+  if (dispatched.length > 0) {
+    const names = dispatched.map(toolCall => toolCall.result?.unit?.name || toolCall.arguments?.unitId).join(', ');
+    lines.push(`Dispatched ${dispatched.length} unit(s): ${names}.`);
+  }
+  return lines.join(' ');
+}
 
 function buildUserMessage(event, snapshot) {
-  const stats     = snapshot.stats;
-  const unitsAvail = snapshot.units.filter(u => u.status === 'available');
-  const activeInc  = snapshot.activeIncidents.filter(i => i.id !== event.id);
+  const stats = snapshot.stats;
+  const availableUnits = snapshot.units.filter(unit => unit.status === 'available');
+  const activeIncidents = snapshot.activeIncidents.filter(incident => incident.id !== event.id);
 
-  return `INCOMING EMERGENCY — IMMEDIATE RESPONSE REQUIRED
+  return `EMERGENCY REQUIRING IMMEDIATE RESPONSE:
 
-INCIDENT:
-  Type:        ${event.type}${event.subtype ? `/${event.subtype}` : ''}
-  Zone:        ${event.zone}
-  Priority:    ${event.priority}/10
-  Description: ${event.description}
-  ID:          ${event.id}
+Type: ${event.type}${event.subtype ? `/${event.subtype}` : ''}
+Zone: ${event.zone}
+Priority: ${event.priority}/10
+Description: ${event.description}
+ID: ${event.id}
 
-CURRENT CITY STATE:
-  Available units: ${stats.availableUnits}/${stats.totalUnits}
-    Police:  ${unitsAvail.filter(u=>u.type==='police').length}
-    Fire:    ${unitsAvail.filter(u=>u.type==='fire').length}
-    EMS:     ${unitsAvail.filter(u=>u.type==='ems').length}
-    Traffic: ${unitsAvail.filter(u=>u.type==='traffic').length}
-  Blocked roads: ${stats.blockedRoads > 0 ? snapshot.blockedEdges.join(', ') : 'none'}
-  Other active incidents: ${activeInc.length > 0 ? activeInc.map(i=>`${i.type} in ${i.zone} (P${i.priority})`).join('; ') : 'none'}
+CITY STATE:
+Available units: ${stats.availableUnits}/${stats.totalUnits}
+  Police: ${availableUnits.filter(unit => unit.type === 'police').length}
+  Fire:   ${availableUnits.filter(unit => unit.type === 'fire').length}
+  EMS:    ${availableUnits.filter(unit => unit.type === 'ems').length}
+  Traffic:${availableUnits.filter(unit => unit.type === 'traffic').length}
+Blocked roads: ${stats.blockedRoads > 0 ? snapshot.blockedEdges.join(', ') : 'none'}
+Other active: ${activeIncidents.length > 0 ? activeIncidents.map(incident => `${incident.type} in ${incident.zone}`).join('; ') : 'none'}
 
-Begin your assessment and coordinate the response now.`;
+Call getAvailableUnits() first, then coordinate your response.`;
 }
 
 function extractFinalDecision(messages) {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i];
-    if (msg.role === 'assistant' && msg.content?.trim()) {
-      return msg.content.trim();
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message.role === 'assistant' && message.content?.trim()) {
+      return message.content.trim();
     }
   }
-  return 'Response coordinated. See tool execution chain above for dispatched units and routes.';
+  return null;
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}

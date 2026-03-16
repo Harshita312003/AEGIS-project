@@ -114,7 +114,7 @@ async function layer2LLMScore(text, originalEvent) {
   try {
     const response = await groq.chat.completions.create({
       model: MODEL,
-      max_tokens: 80,
+      max_tokens: 60,
       temperature: 0,
       messages: [
         {

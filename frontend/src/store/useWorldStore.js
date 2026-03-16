@@ -18,6 +18,21 @@ function baseId(id) {
   return (id || '').replace(/^replan-/, '');
 }
 
+function descriptionKey(text) {
+  return (text || '').slice(0, 50).trim().toLowerCase();
+}
+
+function isMeaningfulDecision(decision) {
+  const trimmed = (decision || '').trim();
+  return !!trimmed && trimmed !== 'Response coordinated. See tool execution chain above';
+}
+
+function pickBetterDecision(existingDecision, incomingDecision) {
+  if (isMeaningfulDecision(incomingDecision)) return incomingDecision;
+  if (isMeaningfulDecision(existingDecision)) return existingDecision;
+  return incomingDecision || existingDecision || '';
+}
+
 export const useWorldStore = create((set, get) => ({
   connected:      false,
   units:          [],
@@ -56,7 +71,19 @@ export const useWorldStore = create((set, get) => ({
   })),
 
   addIncident: incident => set(state => {
+    const source = incident.metadata?._source || incident._source;
+    const incidentDescriptionKey = descriptionKey(incident.description);
+    const isLiveNews = source === 'live_news' || source === 'live_news_keyword';
+
     if (state.eventFeed.some(e => e.id === incident.id)) return {};
+    if (
+      isLiveNews &&
+      incidentDescriptionKey &&
+      state.eventFeed.some(e => descriptionKey(e.description) === incidentDescriptionKey)
+    ) {
+      return {};
+    }
+
     return {
       incidents: [incident, ...state.incidents.filter(i => i.id !== incident.id)].slice(0, 30),
       eventFeed: [
@@ -66,7 +93,7 @@ export const useWorldStore = create((set, get) => ({
           zone:        incident.zone,
           priority:    incident.priority,
           description: incident.description,
-          source:      incident.metadata?._source || incident._source,
+          source,
           headline:    incident.metadata?._headline,
           timestamp:   incident.createdAt || new Date().toISOString(),
         },
@@ -80,7 +107,7 @@ export const useWorldStore = create((set, get) => ({
   })),
 
   // ── Thought: ONE active card at a time ────────────────────────────────────
-  startThought: ({ agentId, incidentId }) => {
+  startThought: ({ agentId, incidentId, eventType = null, zone = null }) => {
     const base = baseId(incidentId);
     set(state => {
       // If there's an active thought for the same base incident, just reset it
@@ -89,6 +116,8 @@ export const useWorldStore = create((set, get) => ({
           activeThought: {
             ...state.activeThought,
             incidentId,
+            eventType,
+            zone,
             tokens: '',
             toolCalls: [],
             done: false,
@@ -105,6 +134,7 @@ export const useWorldStore = create((set, get) => ({
         activeThought: {
           id: `${agentId}-${base}`,
           agentId, incidentId, baseId: base,
+          eventType, zone,
           tokens: '', toolCalls: [], done: false,
           replanCount: 0,
           startedAt: new Date().toISOString(),
@@ -148,19 +178,27 @@ export const useWorldStore = create((set, get) => ({
   addSecurityEvent: ev => set(state => {
     if (ev.eventType === 'FIREWALL_PASS') return {};
     if (state.securityFeed.some(e => e.eventId === ev.eventId && ev.eventId)) return {};
-    return { securityFeed: [{ ...ev, _key: Date.now() }, ...state.securityFeed].slice(0, 10) };
+    if (state.securityFeed.some(e => e._key === ev._key && ev._key)) return {};
+    return { securityFeed: [{ ...ev, _key: ev._key || Date.now() }, ...state.securityFeed].slice(0, 10) };
   }),
 
   // ── Audit — one entry per base incident, always update not duplicate ───────
   addAuditEntry: entry => set(state => {
+    const now = new Date().toISOString();
     const base = baseId(entry.incidentId);
     const idx  = state.auditTimeline.findIndex(e => baseId(e.incidentId) === base);
+    const existing = idx !== -1 ? state.auditTimeline[idx] : null;
+    const existingTools = existing?.toolCalls || [];
+    const incomingTools = entry.toolCalls || [];
 
     const merged = {
+      ...(existing || {}),
       ...entry,
       incidentId: base,
-      toolCalls: entry.toolCalls?.length > 0 ? entry.toolCalls
-               : (idx !== -1 ? state.auditTimeline[idx].toolCalls : []),
+      toolCalls: incomingTools.length >= existingTools.length ? incomingTools : existingTools,
+      decision: pickBetterDecision(existing?.decision, entry.decision),
+      timestamp: entry.timestamp || existing?.timestamp || now,
+      updatedAt: now,
     };
 
     if (idx !== -1) {

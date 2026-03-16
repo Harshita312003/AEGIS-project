@@ -6,22 +6,36 @@ const WS_URL = 'ws://localhost:8001';
 export function useSocket() {
   const wsRef        = useRef(null);
   const reconnectRef = useRef(null);
-  const store        = useWorldStore();
 
   useEffect(() => {
     connect();
-    return () => { clearTimeout(reconnectRef.current); wsRef.current?.close(); };
+    return () => {
+      clearTimeout(reconnectRef.current);
+      wsRef.current?.close();
+      wsRef.current = null;
+    };
   }, []);
 
   function connect() {
+    if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) {
+      return;
+    }
+
     try {
       const ws    = new WebSocket(WS_URL);
       wsRef.current = ws;
-      ws.onopen   = ()    => store.setConnected(true);
-      ws.onclose  = ()    => { store.setConnected(false); reconnectRef.current = setTimeout(connect, 2000); };
+      ws.onopen   = ()    => useWorldStore.getState().setConnected(true);
+      ws.onclose  = ()    => {
+        useWorldStore.getState().setConnected(false);
+        wsRef.current = null;
+        reconnectRef.current = setTimeout(connect, 2000);
+      };
       ws.onerror  = ()    => {};
-      ws.onmessage = evt => { try { route(JSON.parse(evt.data), store); } catch {} };
-    } catch { reconnectRef.current = setTimeout(connect, 3000); }
+      ws.onmessage = evt => { try { route(JSON.parse(evt.data), useWorldStore.getState()); } catch {} };
+    } catch {
+      wsRef.current = null;
+      reconnectRef.current = setTimeout(connect, 3000);
+    }
   }
 }
 
