@@ -1099,9 +1099,10 @@ const ROUTE_COLORS = {
 
 export function CityMap() {
   const units      = useWorldStore(s => s.units);
-  const incidents  = useWorldStore(s => s.incidents.filter(i=>i.status==='active'));
+  const incidents  = useWorldStore(s => s.incidents);
   const replan     = useWorldStore(s => s.replanBanner);
   const unitRoutes = useWorldStore(s => s.unitRoutes);
+  const activeIncidents = incidents.filter(i => i.status === 'active');
   const available  = units.filter(u=>u.status==='available').length;
   const deployed   = units.filter(u=>u.status==='dispatched').length;
 
@@ -1166,7 +1167,7 @@ export function CityMap() {
           );
         })}
 
-        {incidents.map(inc => {
+        {activeIncidents.map(inc => {
           const z = ZONE_META[inc.zone];
           if (!z) return null;
           return (
