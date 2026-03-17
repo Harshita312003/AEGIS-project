@@ -1,44 +1,32 @@
 import { worldState } from '../core/worldState.js';
 import { logger } from '../utils/logger.js';
+import { broadcast } from '../utils/broadcast.js';
 
-// ─── Resource Tracker Tool ────────────────────────────────────────────────────
-// All unit management operations the coordinator can call via function calling.
-// Each function mutates WorldState and the change propagates via EventEmitter
-// to the broadcast layer → WebSocket → live frontend map.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Tool: getAvailableUnits
- * Query all available (non-dispatched) units. Filter by type and/or zone.
- * The coordinator calls this first before deciding which unit to dispatch.
- */
 export async function getAvailableUnits({ type = null, zone = null } = {}) {
   logger.tool('getAvailableUnits', { type, zone });
 
   const units = worldState.getAvailableUnits(type, zone);
-
-  // Build a rich response the LLM can reason over
   const summary = {
-    police:  units.filter(u => u.type === 'police').length,
-    fire:    units.filter(u => u.type === 'fire').length,
-    ems:     units.filter(u => u.type === 'ems').length,
-    traffic: units.filter(u => u.type === 'traffic').length,
+    police: units.filter(unit => unit.type === 'police').length,
+    fire: units.filter(unit => unit.type === 'fire').length,
+    ems: units.filter(unit => unit.type === 'ems').length,
+    traffic: units.filter(unit => unit.type === 'traffic').length,
   };
 
   return {
     success: true,
     totalAvailable: units.length,
     summary,
-    units: units.map(u => ({
-      id:          u.id,
-      name:        u.name,
-      callSign:    u.callSign,
-      type:        u.type,
-      subtype:     u.subtype,
-      currentZone: u.currentZone,
-      specialty:   u.specialty,
-      capacity:    u.capacity,
-      equipment:   u.equipment,
+    units: units.map(unit => ({
+      id: unit.id,
+      name: unit.name,
+      callSign: unit.callSign,
+      type: unit.type,
+      subtype: unit.subtype,
+      currentZone: unit.currentZone,
+      specialty: unit.specialty,
+      capacity: unit.capacity,
+      equipment: unit.equipment,
     })),
     note: units.length === 0
       ? `No ${type || 'any'} units available${zone ? ` in ${zone}` : ''}. All units may be dispatched.`
@@ -46,48 +34,72 @@ export async function getAvailableUnits({ type = null, zone = null } = {}) {
   };
 }
 
-/**
- * Tool: dispatchUnit
- * Dispatch a specific unit to a destination zone for a given incident.
- * The unit status changes to 'dispatched' immediately.
- */
 export async function dispatchUnit({ unitId, destination, incidentId }) {
   logger.tool('dispatchUnit', { unitId, destination, incidentId });
 
+  const unit = worldState.getUnit(unitId);
+  if (unit && unit.status !== 'available') {
+    const alternatives = worldState.getAvailableUnits(unit.type);
+    safeBroadcast({
+      type: 'CONFLICT_DETECTED',
+      payload: {
+        requestedUnit: unitId,
+        requestedBy: incidentId,
+        currentlyServing: unit.incidentId,
+        unitType: unit.type,
+        alternativesCount: alternatives.length,
+        resolution: alternatives.length > 0
+          ? `Redirected to ${alternatives[0].name} (${alternatives[0].currentZone})`
+          : 'No alternatives - queued for next available unit',
+        timestamp: new Date().toISOString(),
+      },
+    });
+
+    logger.warn(`Conflict detected for ${unitId}: already serving ${unit.incidentId}`);
+    return {
+      success: false,
+      error: `${unit.name} is dispatched to incident ${unit.incidentId}`,
+      alternatives: alternatives.slice(0, 3).map(alternative => ({
+        id: alternative.id,
+        name: alternative.name,
+        currentZone: alternative.currentZone,
+      })),
+      resolution: alternatives.length > 0
+        ? `Use ${alternatives[0].id} (${alternatives[0].name}) instead`
+        : 'All units of this type are deployed',
+    };
+  }
+
   try {
-    const unit = worldState.dispatchUnit(unitId, destination, incidentId);
+    const dispatchedUnit = worldState.dispatchUnit(unitId, destination, incidentId);
     return {
       success: true,
       unit: {
-        id:          unit.id,
-        name:        unit.name,
-        callSign:    unit.callSign,
-        type:        unit.type,
-        currentZone: unit.currentZone,
+        id: dispatchedUnit.id,
+        name: dispatchedUnit.name,
+        callSign: dispatchedUnit.callSign,
+        type: dispatchedUnit.type,
+        currentZone: dispatchedUnit.currentZone,
         destination,
       },
       incidentId,
-      message: `${unit.callSign} dispatched to ${destination} for incident ${incidentId}. Status: DISPATCHED.`,
+      message: `${dispatchedUnit.callSign} dispatched to ${destination} for incident ${incidentId}. Status: DISPATCHED.`,
     };
   } catch (err) {
     logger.error('dispatchUnit failed:', err.message);
-
-    // Helpful error: list available alternatives
-    const unitObj = worldState.getUnit(unitId);
-    const alternatives = worldState.getAvailableUnits(unitObj?.type);
+    const alternatives = worldState.getAvailableUnits(unit?.type);
     return {
       success: false,
       error: err.message,
-      alternatives: alternatives.slice(0, 3).map(u => ({ id: u.id, name: u.name, zone: u.currentZone })),
+      alternatives: alternatives.slice(0, 3).map(alternative => ({
+        id: alternative.id,
+        name: alternative.name,
+        zone: alternative.currentZone,
+      })),
     };
   }
 }
 
-/**
- * Tool: returnUnit
- * Return a dispatched unit to available status.
- * Called during replan (recall en-route units) or after incident resolution.
- */
 export async function returnUnit({ unitId }) {
   logger.tool('returnUnit', { unitId });
 
@@ -103,26 +115,21 @@ export async function returnUnit({ unitId }) {
   }
 }
 
-/**
- * Tool: notifyCitizens
- * Broadcast a public alert to citizens in a specific zone.
- * Appears in the EventFeed and SecurityFeed on the dashboard.
- */
 export async function notifyCitizens({ zone, message, severity }) {
   logger.tool('notifyCitizens', { zone, message, severity });
 
   const notification = {
-    id:        `notif-${Date.now()}`,
+    id: `notif-${Date.now()}`,
     zone,
     message,
     severity,
     timestamp: new Date().toISOString(),
-    channel:   'public_alert_system',
+    channel: 'public_alert_system',
   };
 
   worldState.emit('citizenNotification', notification);
   worldState.emit('stateChange', {
-    type:    'CITIZEN_NOTIFICATION',
+    type: 'CITIZEN_NOTIFICATION',
     payload: notification,
   });
 
@@ -133,7 +140,13 @@ export async function notifyCitizens({ zone, message, severity }) {
   };
 }
 
-// ─── Groq Function Schemas ────────────────────────────────────────────────────
+function safeBroadcast(payload) {
+  try {
+    broadcast(payload);
+  } catch (err) {
+    logger.warn('Conflict broadcast failed:', err.message);
+  }
+}
 
 const ZONE_ENUM = ['CP', 'RP', 'KB', 'LN', 'DW', 'RH', 'SD', 'NP', 'IGI', 'OKH'];
 

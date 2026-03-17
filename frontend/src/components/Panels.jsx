@@ -279,13 +279,13 @@ export function AuditTimeline() {
 // ─── CityMap ──────────────────────────────────────────────────────────────────
 
 function makeUnitIcon(type, status) {
-  const map = { police:{color:'#3b82f6',s:'🚔'}, fire:{color:'#ff3b5c',s:'🚒'}, ems:{color:'#00ff88',s:'🚑'}, traffic:{color:'#ffd700',s:'🚦'} };
+  const map = { police:{color:'#60a5fa',s:'🚔'}, fire:{color:'#f87171',s:'🚒'}, ems:{color:'#4ade80',s:'🚑'}, traffic:{color:'#facc15',s:'🚦'} };
   const {color,s} = map[type] || {color:'#94a3b8',s:'●'};
   const deployed = status === 'dispatched';
   return L.divIcon({
     className: '',
-    html: `<div style="position:relative;font-size:${deployed?22:18}px;filter:drop-shadow(0 0 ${deployed?8:3}px ${color});opacity:${deployed?1:0.7}">${s}${deployed?`<div style="position:absolute;top:-3px;right:-3px;width:7px;height:7px;background:#ff6b35;border-radius:50%;border:1px solid #080d18;animation:pulse 0.8s ease-in-out infinite"></div>`:''}</div>`,
-    iconSize:[28,28], iconAnchor:[14,14],
+    html: `<div style="position:relative;font-size:${deployed?24:18}px;filter:drop-shadow(0 0 ${deployed?10:4}px ${color});opacity:${deployed?1:0.65};transition:all 0.3s">${s}${deployed?`<div style="position:absolute;top:-4px;right:-4px;width:9px;height:9px;background:#ff6b35;border-radius:50%;border:2px solid #080d18;animation:pulse 0.8s ease-in-out infinite;box-shadow:0 0 6px #ff6b35"></div>`:''}</div>`,
+    iconSize:[32,32], iconAnchor:[16,16],
   });
 }
 
@@ -300,10 +300,10 @@ function makeIncidentIcon(priority) {
 
 // Route colors per unit type — matches marker colors
 const ROUTE_COLORS = {
-  police:  '#3b82f6',
-  fire:    '#ff3b5c',
-  ems:     '#00ff88',
-  traffic: '#ffd700',
+  police:  '#60a5fa',
+  fire:    '#f87171',
+  ems:     '#4ade80',
+  traffic: '#facc15',
 };
 
 export function CityMap() {
@@ -357,9 +357,11 @@ export function CityMap() {
               positions={positions}
               pathOptions={{
                 color,
-                weight:    3,
-                opacity:   0.75,
-                dashArray: '8 6',
+                weight:    4,
+                opacity:   0.9,
+                dashArray: '12 6',
+                lineCap:   'round',
+                lineJoin:  'round',
               }}
             >
               <Popup>

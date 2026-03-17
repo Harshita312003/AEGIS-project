@@ -8,8 +8,8 @@ import { eventQueue } from './eventQueue.js';
 import { logger } from '../utils/logger.js';
 import { v4 as uuidv4 } from 'uuid';
 
-const POLL_INTERVAL_MS     = 300_000;  // 5 minutes between polls
-const MIN_INJECT_GAP_MS    = 300_000;  // 5 minutes minimum between ANY injection
+const POLL_INTERVAL_MS     = 90_000;   // 1.5 minutes between polls for demo mode
+const MIN_INJECT_GAP_MS    = 90_000;   // 1.5 minutes minimum between ANY injection
 const TYPE_ZONE_COOLDOWN   = 600_000;  // 10 minutes before same type+zone can repeat
 
 const NEWS_URL = 'https://news.google.com/rss/search?q=Delhi+fire+OR+accident+OR+collapse+OR+flood+OR+explosion&hl=en-IN&gl=IN&ceid=IN:en';
